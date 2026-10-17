@@ -19,16 +19,66 @@ sudo systemctl enable --now time-server
 journalctl -u time-server -f       # should print "listening on 0.0.0.0:123"
 ```
 
-Make sure UDP port 123 is open in the firewall. Don't also run an NTP client on this machine
+Make sure UDP port 123 (NTP) and TCP port 8123 (HTTP/JSON, for `get-date.sh`) are open in the
+firewall. Don't also run an NTP client on this machine
 that points at itself.
 
 For a quick manual run instead of the service:
 
 ```bash
 sudo setcap cap_net_bind_service=+ep target/release/time-server
-./target/release/time-server               # binds 0.0.0.0:123 (all VLANs)
-./target/release/time-server 0.0.0.0:1234  # custom address/port, no privileges needed
+./target/release/time-server                              # NTP on 0.0.0.0:123, HTTP on 0.0.0.0:8123
+./target/release/time-server 0.0.0.0:1234 0.0.0.0:8080    # custom NTP / HTTP addresses
 ```
+
+### Nix / NixOS
+
+```bash
+nix build github:dbreth/rs-local-time-server     # result/bin/{time-server,get-date.sh}
+nix run github:dbreth/rs-local-time-server       # run the server
+```
+
+NixOS module (opens UDP 123 / TCP 8123 by default):
+
+```nix
+{
+  inputs.time-server.url = "github:dbreth/rs-local-time-server";
+
+  outputs = { nixpkgs, time-server, ... }: {
+    nixosConfigurations.base = nixpkgs.lib.nixosSystem {
+      modules = [
+        time-server.nixosModules.default
+        {
+          services.time-server.enable = true;
+          # services.time-server.ntpAddress = "0.0.0.0:123";
+          # services.time-server.httpAddress = "0.0.0.0:8123";
+          # services.time-server.openFirewall = true;
+        }
+      ];
+    };
+  };
+}
+```
+
+## One-shot sync, no configuration (`get-date.sh`)
+
+On any machine that can reach the base station, run:
+
+```bash
+./get-date.sh BASE_IP          # or: get-date.sh BASE_IP 8123
+# or, with Nix: nix run github:dbreth/rs-local-time-server#get-date -- BASE_IP
+```
+
+It fetches the time from the server's HTTP endpoint (pure bash, no curl/jq), corrects for half the
+round-trip time, and sets the clock with `sudo date -s`. The endpoint just returns JSON:
+
+```bash
+$ curl BASE_IP:8123
+{"unix_ns":1792208538050733711,"unix":1792208538.050733711}
+```
+
+This is a one-time set: the clock will start drifting again afterwards (~3 ms/minute), so for
+anything long-running configure an NTP client as below.
 
 ## Rover computes (clients)
 

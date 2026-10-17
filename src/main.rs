@@ -1,10 +1,13 @@
 //! Minimal SNTP server: answers standard NTP client requests with this machine's clock,
 //! so rover computes can sync using the stock `systemd-timesyncd` / `chronyd` clients.
+//! Also serves the current time as JSON over HTTP, for one-shot `get-date.sh` syncs.
 //!
-//! Usage: time-server [BIND_ADDR]   (default 0.0.0.0:123)
+//! Usage: time-server [NTP_ADDR] [HTTP_ADDR]   (defaults 0.0.0.0:123, 0.0.0.0:8123)
 
-use std::net::UdpSocket;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Seconds between 1900-01-01 (NTP epoch) and 1970-01-01 (Unix epoch).
 const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
@@ -13,9 +16,7 @@ const MODE_CLIENT: u8 = 3;
 const MODE_SERVER: u8 = 4;
 
 fn ntp_now() -> [u8; 8] {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before 1970");
+    let d = unix_now();
     let secs = (d.as_secs() + NTP_UNIX_OFFSET) as u32;
     let frac = (((d.subsec_nanos() as u64) << 32) / 1_000_000_000) as u32;
     let mut out = [0u8; 8];
@@ -40,12 +41,67 @@ fn build_response(req: &[u8; NTP_PACKET_LEN], rx: [u8; 8]) -> [u8; NTP_PACKET_LE
     resp
 }
 
+fn unix_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before 1970")
+}
+
+fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    // Read (and ignore) the request until the end of its headers; every path gets the same reply.
+    let mut buf = [0u8; 4096];
+    let mut len = 0;
+    while len < buf.len() {
+        let n = stream.read(&mut buf[len..])?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let d = unix_now();
+    let body = format!(
+        "{{\"unix_ns\":{},\"unix\":{}.{:09}}}\n",
+        d.as_nanos(),
+        d.as_secs(),
+        d.subsec_nanos()
+    );
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes())
+}
+
+fn serve_http(listener: TcpListener) {
+    for stream in listener.incoming() {
+        match stream {
+            // One thread per connection so a slow client can't stall the others.
+            Ok(s) => {
+                thread::spawn(move || {
+                    if let Err(e) = handle_http(s) {
+                        eprintln!("http error: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("http accept error: {e}"),
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:123".to_string());
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "0.0.0.0:123".to_string());
+    let http_addr = args.next().unwrap_or_else(|| "0.0.0.0:8123".to_string());
+
     let sock = UdpSocket::bind(&addr)?;
-    eprintln!("time-server listening on {addr}");
+    eprintln!("time-server listening on {addr} (ntp)");
+    let listener = TcpListener::bind(&http_addr)?;
+    eprintln!("time-server listening on {http_addr} (http/json)");
+    thread::spawn(move || serve_http(listener));
 
     let mut req = [0u8; NTP_PACKET_LEN];
     loop {
