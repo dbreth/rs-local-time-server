@@ -19,6 +19,17 @@ sudo systemctl enable --now time-server
 journalctl -u time-server -f       # should print "listening on 0.0.0.0:123"
 ```
 
+Every time a device gets the time, a line is logged to stdout with its address (and NTP version, or
+the HTTP request), and the first request from each IP is marked `★ new client`:
+
+```
+2026-10-25T14:03:12.481Z  INFO   NTP   10.0.20.5:123          v4  ★ new client
+2026-10-25T14:04:01.117Z  INFO   HTTP  10.0.10.7:51234        GET /
+```
+
+Output is coloured in a terminal and plain under journald or when piped. Set `RUST_LOG=warn` to
+hide the per-request lines, or `RUST_LOG=debug` to also see ignored (non-client) NTP packets.
+
 Make sure UDP port 123 (NTP) and TCP port 8123 (HTTP/JSON, for `get-date.sh`) are open in the
 firewall. Don't also run an NTP client on this machine
 that points at itself.
